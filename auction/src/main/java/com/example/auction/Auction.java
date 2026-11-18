@@ -10,12 +10,19 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
 
 /**
- * Весь аукцион живёт в памяти процесса.
+ * Способ 1 (ветка fix/01-synchronized-methods): ключевое слово synchronized
+ * на всех методах — «грубый монитор».
  *
- * ВНИМАНИЕ: HashMap, ArrayList и nextItemId++ НЕ потокобезопасны.
- * Это сделано нарочно: Spring обрабатывает каждый запрос в своём потоке,
- * поэтому при параллельных запросах сервис может сломаться или испортить данные.
- * Исправлять это будем в следующих ветках.
+ * Одна блокировка на весь сервис делает атомарными сразу всё:
+ *   G1 инкремент nextItemId++/nextBidId++,
+ *   G2 put/add в HashMap/ArrayList,
+ *   G3 проверку «ставка выше текущей» + вставку,
+ *   G4 составной removeItem,
+ *   G5 видимость ( synchronized = happens-before ).
+ *
+ * Плюсы: минимум кода, ошибиться почти нельзя.
+ * Минусы: сериализует всё — даже GET /items ждёт, пока кто-то делает ставку.
+ * Сравните цифры LoadTest с main и с ветками 06/07/08.
  */
 @Service
 public class Auction {
@@ -27,14 +34,14 @@ public class Auction {
     private long nextBidId = 1;
 
     /** Выставить товар на аукцион. */
-    public Item addItem(String name, long startPrice) {
+    public synchronized Item addItem(String name, long startPrice) {
         Item item = new Item(nextItemId++, name, startPrice);
         items.put(item.id(), item);
         return item;
     }
 
     /** Снять товар с продажи (вместе со ставками). */
-    public void removeItem(long id) {
+    public synchronized void removeItem(long id) {
         if (items.remove(id) == null) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Товар " + id + " не найден");
         }
@@ -42,7 +49,7 @@ public class Auction {
     }
 
     /** Список всех товаров. */
-    public List<Item> listItems() {
+    public synchronized List<Item> listItems() {
         return new ArrayList<>(items.values());
     }
 
@@ -50,7 +57,7 @@ public class Auction {
      * Сделать ставку. Простое правило: ставка должна быть выше
      * текущей лучшей (или стартовой цены, если ставок ещё нет).
      */
-    public Bid addBid(long itemId, String bidder, long amount) {
+    public synchronized Bid addBid(long itemId, String bidder, long amount) {
         Item item = items.get(itemId);
         if (item == null) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Товар " + itemId + " не найден");
@@ -71,11 +78,12 @@ public class Auction {
         return bid;
     }
 
-    /** Список ставок на товар. */
-    public List<Bid> listBids(long itemId) {
+    /** Список ставок на товар. Копию делаем ПОД блокировкой: иначе сериализация
+     * ответа уже без lock увидит параллельный add в тот же ArrayList. */
+    public synchronized List<Bid> listBids(long itemId) {
         if (!items.containsKey(itemId)) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Товар " + itemId + " не найден");
         }
-        return bids.getOrDefault(itemId, List.of());
+        return new ArrayList<>(bids.getOrDefault(itemId, List.of()));
     }
 }

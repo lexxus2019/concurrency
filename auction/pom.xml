@@ -14,10 +14,32 @@
     <name>auction</name>
     <description>Сервис аукциона: хранит товары и ставки в памяти</description>
 
+    <properties>
+        <!-- Boot 3.5 по умолчанию тащит Artemis 2.40, который не запускается на JDK 23+
+             (UnsupportedOperationException: getSubject is not supported; проверено — 2.41
+             тоже ещё сломан). Просим свежую версию: свойство переопределяет import
+             artemis-bom в родительском BOM. Предупреждение "relocated to
+             org.apache.artemis" — это миграция Artemis на новый groupId (2.50+), Maven
+             подхватывает сам, оно безвредное. -->
+        <artemis.version>2.57.0</artemis.version>
+    </properties>
+
     <dependencies>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <!-- Ветка fix/10: очередь сообщений вместо блокировок.
+             artemis-jakarta-server = ядро брокера + JMS-часть в jakarta-неймспейсе,
+             нужен для spring.artemis.mode=embedded (класс JMSConfiguration). -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-artemis</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.activemq</groupId>
+            <artifactId>artemis-jakarta-server</artifactId>
+            <scope>runtime</scope>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>

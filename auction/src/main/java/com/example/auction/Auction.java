@@ -1,81 +1,107 @@
 package com.example.auction;
 
-import java.util.ArrayList;
-import java.util.HashMap;
+import java.io.IOException;
 import java.util.List;
-import java.util.Map;
 
 import org.springframework.http.HttpStatus;
+import org.springframework.jms.core.JmsTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
+import org.springframework.jms.JmsException;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
- * Весь аукцион живёт в памяти процесса.
+ * СПОСОБ 10 (ветка fix/10-embedded-artemis): очередь сообщений ВМЕСТО блокировок.
  *
- * ВНИМАНИЕ: HashMap, ArrayList и nextItemId++ НЕ потокобезопасны.
- * Это сделано нарочно: Spring обрабатывает каждый запрос в своём потоке,
- * поэтому при параллельных запросах сервис может сломаться или испортить данные.
- * Исправлять это будем в следующих ветках.
+ * Контраллер не изменился: он по-прежнему дергает методы Auction. Но теперь
+ * каждый вызов — это не заход в synchronized, а ОТПРАВКА КОМАНДЫ в брокер
+ * (embedded ActiveMQ Artemis) и ожидание ответа. Состояние меняет единственный
+ * потребитель очереди (AuctionCommandListener), значит конкурентной записи нет
+ * по построению — см. AuctionState.
+ *
+ * Что появляется «бесплатно», чего не даёт ни один вид synchronized:
+ *  - очередь можно измерить (размер = сколько торгов стоит в ожидании);
+ *  - запрос переживает рассинхронизацию пиков;
+ *  - это же решение, вынесенное за пределы процесса, = микросервисная архитектура.
+ *
+ * Цена: round-trip через брокер на каждый запрос (см. LoadTest этой ветки),
+ * и зависимость от живости брокера (что если брокер лёг, пока ждём ответ?
+ * — таймаут в ask()).
  */
 @Service
 public class Auction {
 
-    private final Map<Long, Item> items = new HashMap<>();
-    private final Map<Long, List<Bid>> bids = new HashMap<>();
+    private static final String COMMAND_QUEUE = "auction.cmd";
 
-    private long nextItemId = 1;
-    private long nextBidId = 1;
+    private final JmsTemplate jms;
+    private final ObjectMapper mapper;
+
+    Auction(JmsTemplate jms, ObjectMapper mapper) {
+        this.jms = jms;
+        this.mapper = mapper;
+    }
 
     /** Выставить товар на аукцион. */
     public Item addItem(String name, long startPrice) {
-        Item item = new Item(nextItemId++, name, startPrice);
-        items.put(item.id(), item);
-        return item;
+        JsonNode result = ask(new Command("addItem", -1, name, startPrice, null, null));
+        return mapper.convertValue(result, Item.class);
     }
 
     /** Снять товар с продажи (вместе со ставками). */
     public void removeItem(long id) {
-        if (items.remove(id) == null) {
-            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Товар " + id + " не найден");
-        }
-        bids.remove(id);
+        ask(new Command("removeItem", id, null, null, null, null));
     }
 
     /** Список всех товаров. */
     public List<Item> listItems() {
-        return new ArrayList<>(items.values());
+        JsonNode result = ask(new Command("listItems", -1, null, null, null, null));
+        return mapper.convertValue(result, new TypeReference<List<Item>>() {
+        });
     }
 
-    /**
-     * Сделать ставку. Простое правило: ставка должна быть выше
-     * текущей лучшей (или стартовой цены, если ставок ещё нет).
-     */
+    /** Сделать ставку. */
     public Bid addBid(long itemId, String bidder, long amount) {
-        Item item = items.get(itemId);
-        if (item == null) {
-            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Товар " + itemId + " не найден");
-        }
-
-        List<Bid> itemBids = bids.getOrDefault(itemId, List.of());
-        long best = item.startPrice();
-        for (Bid bid : itemBids) {
-            best = Math.max(best, bid.amount());
-        }
-        if (amount <= best) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
-                    "Ставка должна быть выше " + best);
-        }
-
-        Bid bid = new Bid(nextBidId++, itemId, bidder, amount);
-        bids.computeIfAbsent(itemId, key -> new ArrayList<>()).add(bid);
-        return bid;
+        JsonNode result = ask(new Command("addBid", itemId, null, null, bidder, amount));
+        return mapper.convertValue(result, Bid.class);
     }
 
     /** Список ставок на товар. */
     public List<Bid> listBids(long itemId) {
-        if (!items.containsKey(itemId)) {
-            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Товар " + itemId + " не найден");
+        JsonNode result = ask(new Command("listBids", itemId, null, null, null, null));
+        return mapper.convertValue(result, new TypeReference<List<Bid>>() {
+        });
+    }
+
+    /** Отправить команду в очередь и дождаться ответа (не больше receive-timeout). */
+    private JsonNode ask(Command command) {
+        try {
+            String json = mapper.writeValueAsString(command);
+            var replyMessage = jms.sendAndReceive(COMMAND_QUEUE,
+                    session -> session.createTextMessage(json));
+            if (!(replyMessage instanceof jakarta.jms.TextMessage reply)) {
+                throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                        "Аукцион прислал непонятный ответ");
+            }
+            Reply envelope = mapper.readValue(reply.getText(), Reply.class);
+            if (envelope.error() != null) {
+                String[] codeAndReason = envelope.error().split(":", 2);
+                throw new ResponseStatusException(
+                        HttpStatus.valueOf(Integer.parseInt(codeAndReason[0])), codeAndReason[1]);
+            }
+            return envelope.result();
+        } catch (JmsException | jakarta.jms.JMSException e) {
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                    "Брокер сообщений недоступен: " + e.getMessage());
+        } catch (JsonProcessingException e) {
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Сбой JSON на стороне аукциона", e);
+        } catch (IOException e) {
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Сбой при чтении ответа брокера", e);
         }
-        return bids.getOrDefault(itemId, List.of());
     }
 }

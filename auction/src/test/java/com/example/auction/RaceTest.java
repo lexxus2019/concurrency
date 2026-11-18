@@ -180,6 +180,22 @@ class RaceTest {
                         .map(Bid::amount).collect(Collectors.toSet()))
                         .as("Суммы всех принятых ставок уникальны")
                         .hasSize(THREADS);
+                // инвариант atomicity проверки+вставки: ставки фиксируются по
+                // возрастанию, каждая следующая обязана перебивать предыдущую
+                boolean increasing = true;
+                long previousAmount = 0;
+                for (Bid bid : storedBids) {
+                    if (bid == null) continue;
+                    if (bid.amount() <= previousAmount) {
+                        increasing = false;
+                        break;
+                    }
+                    previousAmount = bid.amount();
+                }
+                checks.assertThat(increasing)
+                        .as("Суммы ставок строго растут в списке: каждая ставка обязана была перебить "
+                                + "ту, что уже лежит (check-then-act: проверка и вставка должны быть атомарными)")
+                        .isTrue();
             }
         });
     }
